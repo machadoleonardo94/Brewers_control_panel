@@ -1,0 +1,212 @@
+esphome:
+  name: triac-controller
+  comment: Triac controller for AC load dimming, with 1-wire and 1 channel of open-drain PWM output
+  friendly_name: triac-control
+  on_boot:
+    priority: -100
+    then:
+      - climate.pid.set_control_parameters:
+          id: triac_pid
+          kp: !lambda "return id(pid_kp_saved);"
+          ki: !lambda "return id(pid_ki_saved);"
+          kd: !lambda "return id(pid_kd_saved);"
+      - logger.log:
+          format: "Restored PID params: kp=%.5f ki=%.5f kd=%.5f"
+          args: ["id(pid_kp_saved)", "id(pid_ki_saved)", "id(pid_kd_saved)"]
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  cpu_frequency: 240MHz
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: "tg3kEIL+xim7H9+hbTwFIJTi+hxhPA/S+7pUHg8tuSo="
+
+ota:
+  - platform: esphome
+    password: !secret main_ota_password
+
+wifi:
+  reboot_timeout: 0s
+  networks:
+    - ssid: !secret wifi_ssid_1
+      password: !secret wifi_password_1
+    - ssid: !secret wifi_ssid_2
+      password: !secret wifi_password_2
+    - ssid: !secret wifi_ssid_3
+      password: !secret wifi_password_3
+  ap:
+    ssid: "TriacController"
+    password: ""
+
+# Add captive portal for AP mode
+captive_portal:
+
+# Enable web server for status page
+web_server:
+  port: 80
+  local: true
+  version: 3
+
+# Define I2C bus
+i2c:
+  id: bus_i2c
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  frequency: 400kHz
+
+one_wire:
+  - platform: gpio
+    pin: GPIO16
+
+globals:
+  - id: pid_kp_saved
+    type: float
+    restore_value: yes
+    initial_value: "0.49460"
+  - id: pid_ki_saved
+    type: float
+    restore_value: yes
+    initial_value: "0.00487"
+  - id: pid_kd_saved
+    type: float
+    restore_value: yes
+    initial_value: "12.56301"
+
+output:
+  - platform: ledc
+    pin: GPIO13
+    id: open_drain_output
+
+  - platform: ac_dimmer
+    id: triac_control
+    gate_pin: GPIO14
+    method: leading pulse
+    init_with_half_cycle: false
+    zero_cross_pin:
+      number: GPIO12
+      mode:
+        input: true
+      inverted: yes
+
+climate:
+  - platform: pid
+    name: "Triac PID Control"
+    id: triac_pid
+    sensor: one_wire_temp
+    default_target_temperature: 92°C
+    heat_output: triac_control
+    control_parameters:
+      kp: 0.49460
+      ki: 0.00487
+      kd: 12.56301
+      output_averaging_samples: 5
+      derivative_averaging_samples: 5
+    deadband_parameters:
+      threshold_high: 0.5°C
+      threshold_low: -0.5°C
+      kp_multiplier: 0.0
+      ki_multiplier: 0.05
+      kd_multiplier: 0.0
+      deadband_output_averaging_samples: 15
+
+light:
+  - platform: neopixelbus
+    type: GRB
+    pin: GPIO04
+    num_leds: 1
+    variant: WS2812
+    name: "Status LED"
+    id: status_led
+
+# Status sensors
+sensor:
+  - platform: dallas_temp
+    name: 1Wire Temperature
+    id: one_wire_temp
+    update_interval: 1s
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+# Define text sensors for device status
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "Connected SSID"
+    bssid:
+      name: "Connected BSSID"
+      internal: true
+    mac_address:
+      name: "MAC Address"
+      internal: true
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          const float kp = id(triac_pid).get_kp();
+          const float ki = id(triac_pid).get_ki();
+          const float kd = id(triac_pid).get_kd();
+
+          bool changed = false;
+          if (!isnan(kp) && kp > 0.0f && fabsf(kp - id(pid_kp_saved)) > 0.000001f) {
+            id(pid_kp_saved) = kp;
+            changed = true;
+          }
+          if (!isnan(ki) && ki >= 0.0f && fabsf(ki - id(pid_ki_saved)) > 0.000001f) {
+            id(pid_ki_saved) = ki;
+            changed = true;
+          }
+          if (!isnan(kd) && kd >= 0.0f && fabsf(kd - id(pid_kd_saved)) > 0.000001f) {
+            id(pid_kd_saved) = kd;
+            changed = true;
+          }
+
+          if (changed) {
+            ESP_LOGD("pid_store", "Saved PID params: kp=%.5f ki=%.5f kd=%.5f", id(pid_kp_saved), id(pid_ki_saved), id(pid_kd_saved));
+          }
+
+# Define buttons for device control
+button:
+  - platform: restart
+    name: "Restart Node"
+
+  - platform: template
+    name: "PID Triac Autotune"
+    on_press:
+      - climate.pid.autotune: triac_pid
+
+  - platform: template
+    name: "Apply Saved PID Params"
+    on_press:
+      - climate.pid.set_control_parameters:
+          id: triac_pid
+          kp: !lambda "return id(pid_kp_saved);"
+          ki: !lambda "return id(pid_ki_saved);"
+          kd: !lambda "return id(pid_kd_saved);"
+
+# Add a time component to keep track of time
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time_sync:
+      then:
+        - logger.log: "Time synchronized with Home Assistant"
